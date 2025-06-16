@@ -165,16 +165,24 @@ func parseToolsFile(ctx context.Context, raw []byte) (ToolsFile, error) {
 	return toolsFile, nil
 }
 
-func parse(ctx context.Context, logger log.Logger) {
+func parse(ctx context.Context, buf []byte, logger log.Logger) {
 	logger.DebugContext(ctx, "Attempting to parse updated tools file.")
+	// time.Sleep(5 * time.Second)
+	// logger.DebugContext(ctx, "Parse finished.")
 	// TODO: add logic for parsing
 }
 
 // watchFile checks for changes in the provided yaml tools file.
-func watchFile(toolsFileName string, ctx context.Context, logger log.Logger) {
+func watchFile(ctx context.Context, toolsFileName string) {
+	logger, err := util.LoggerFromContext(ctx)
+	if err != nil {
+		panic(fmt.Errorf("unable to extract logger from context %w", err))
+	}
+
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		logger.WarnContext(ctx, "error setting up new watcher %s", err)
+		return
 	}
 
 	defer w.Close()
@@ -184,39 +192,48 @@ func watchFile(toolsFileName string, ctx context.Context, logger log.Logger) {
 		logger.WarnContext(ctx, "error adding the tools file to watcher %s", err)
 	}
 
-	logger.InfoContext(ctx, fmt.Sprintf("Now watching tools file %s", toolsFileName))
-	var debounceTimer *time.Timer
+	cleanedFilename := filepath.Clean(toolsFileName)
+	logger.DebugContext(ctx, fmt.Sprintf("Now watching tools file %s", cleanedFilename))
+
+	// debounce timer is used to prevent multiple writes triggering multiple reloads
 	debounceDelay := 100 * time.Millisecond
+	debounce := time.NewTimer(1 * time.Minute)
+	debounce.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
-			logger.WarnContext(ctx, "watcher context cancelled")
+			logger.DebugContext(ctx, "file watcher context cancelled")
 			return
 		case err, ok := <-w.Errors:
 			if !ok {
-				logger.WarnContext(ctx, "error watcher alredy closed %s", err)
+				logger.WarnContext(ctx, "file watcher was closed unexpectedly")
+				return
+			}
+			if err != nil {
+				logger.WarnContext(ctx, "file watcher error %s", err)
+				return
 			}
 
-			if err != nil {
-				logger.WarnContext(ctx, "error watching file %s", err)
-			}
 		case e, ok := <-w.Events:
 			if !ok {
-				logger.WarnContext(ctx, "error with event %s", err)
+				logger.WarnContext(ctx, "file watcher already closed")
+				return
 			}
-			if strings.HasSuffix(e.Name, toolsFileName) && e.Op == fsnotify.Write {
-				if debounceTimer == nil {
-					debounceTimer = time.NewTimer(debounceDelay)
-					go func() {
-						<-debounceTimer.C
-						logger.DebugContext(ctx, fmt.Sprintf("%s event detected in tools file: %s", e.Op, e.Name))
-						parse(ctx, logger)
-						debounceTimer = nil
-					}()
-				} else {
-					debounceTimer.Reset(debounceDelay)
-				}
+
+			if e.Op == fsnotify.Write && filepath.Clean(e.Name) == cleanedFilename {
+				logger.DebugContext(ctx, fmt.Sprintf("%s event detected in tools file: %s", e.Op, e.Name))
+				debounce.Reset(debounceDelay)
 			}
+		case <-debounce.C:
+			debounce.Stop()
+			logger.DebugContext(ctx, "re-reading tools file: %s", cleanedFilename)
+			buf, err := os.ReadFile(toolsFileName)
+			if err != nil {
+				logger.WarnContext(ctx, "error reading reloaded file", err)
+				return
+			}
+			parse(ctx, buf, logger)
 		}
 	}
 }
@@ -327,7 +344,7 @@ func run(cmd *Command) error {
 	}()
 
 	// start watching for file changes to trigger dynamic reloading
-	go watchFile(string(cmd.tools_file), ctx, cmd.logger)
+	go watchFile(ctx, cmd.tools_file)
 
 	// wait for either the server to error out or the command's context to be canceled
 	select {

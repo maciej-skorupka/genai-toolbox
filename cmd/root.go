@@ -168,6 +168,7 @@ func parseToolsFile(ctx context.Context, raw []byte) (ToolsFile, error) {
 	return toolsFile, nil
 }
 
+
 func validateReloadEdits(ctx context.Context, toolsFile ToolsFile, logger log.Logger) (map[string]sources.Source, map[string]auth.AuthService, map[string]tools.Tool, map[string]tools.Toolset, error) {
 	logger.DebugContext(ctx, "Attempting to parse and validate reloaded tools file.")
 
@@ -196,11 +197,17 @@ func updateServer(ctx context.Context, l log.Logger, sourcesMap map[string]sourc
 	return nil
 }
 
-// enableDynamicReloading checks for changes in the provided yaml tools file.
-func enableDynamicReloading(toolsFileName string, ctx context.Context, logger log.Logger) {
+// watchFile checks for changes in the provided yaml tools file.
+func watchFile(ctx context.Context, toolsFileName string) {
+	logger, err := util.LoggerFromContext(ctx)
+	if err != nil {
+		panic(fmt.Errorf("unable to extract logger from context %w", err))
+	}
+
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		logger.WarnContext(ctx, "error setting up new watcher %s", err)
+		return
 	}
 
 	defer w.Close()
@@ -210,71 +217,48 @@ func enableDynamicReloading(toolsFileName string, ctx context.Context, logger lo
 		logger.WarnContext(ctx, "error adding the tools file to watcher %s", err)
 	}
 
-	logger.InfoContext(ctx, fmt.Sprintf("Now watching tools file %s", toolsFileName))
-	var debounceTimer *time.Timer
+	cleanedFilename := filepath.Clean(toolsFileName)
+	logger.DebugContext(ctx, fmt.Sprintf("Now watching tools file %s", cleanedFilename))
+
+	// debounce timer is used to prevent multiple writes triggering multiple reloads
 	debounceDelay := 100 * time.Millisecond
+	debounce := time.NewTimer(1 * time.Minute)
+	debounce.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
-			logger.WarnContext(ctx, "watcher context cancelled")
+			logger.DebugContext(ctx, "file watcher context cancelled")
 			return
 		case err, ok := <-w.Errors:
 			if !ok {
-				logger.WarnContext(ctx, "error watcher alredy closed %s", err)
+				logger.WarnContext(ctx, "file watcher was closed unexpectedly")
+				return
+			}
+			if err != nil {
+				logger.WarnContext(ctx, "file watcher error %s", err)
+				return
 			}
 
-			if err != nil {
-				logger.WarnContext(ctx, "error watching file %s", err)
-			}
 		case e, ok := <-w.Events:
 			if !ok {
-				logger.WarnContext(ctx, "error with event %s", err)
+				logger.WarnContext(ctx, "file watcher already closed")
+				return
 			}
-			if strings.HasSuffix(e.Name, toolsFileName) && e.Op == fsnotify.Write {
-				if debounceTimer == nil {
-					debounceTimer = time.NewTimer(debounceDelay)
-					go func() {
-						<-debounceTimer.C
-						logger.DebugContext(ctx, fmt.Sprintf("%s event detected in tools file: %s", e.Op, e.Name))
 
-						buf, err := os.ReadFile(toolsFileName)
-						if err != nil {
-							errMsg := fmt.Errorf("unable to read reloaded tools file at %q: %w", toolsFileName, err)
-							logger.WarnContext(ctx, errMsg.Error())
-							debounceTimer = nil
-							return
-						}
-
-						toolsFile, err := parseToolsFile(ctx, buf)
-						if err != nil {
-							errMsg := fmt.Errorf("unable to parse reloaded tools file at %q: %w", toolsFileName, err)
-							logger.WarnContext(ctx, errMsg.Error())
-							debounceTimer = nil
-							return
-						}
-
-						sourcesMap, authServicesMap, toolsMap, toolsetsMap, err := validateReloadEdits(ctx, toolsFile, logger)
-						if err != nil {
-							errMsg := fmt.Errorf("unable to validate reloaded edits: %w", err)
-							logger.WarnContext(ctx, errMsg.Error())
-							debounceTimer = nil
-							return
-						}
-
-						err = updateServer(ctx, logger, sourcesMap, authServicesMap, toolsMap, toolsetsMap)
-						if err != nil {
-							errMsg := fmt.Errorf("unable to update server after reload: %w", err)
-							logger.WarnContext(ctx, errMsg.Error())
-							debounceTimer = nil
-							return
-						}
-
-						debounceTimer = nil
-					}()
-				} else {
-					debounceTimer.Reset(debounceDelay)
-				}
+			if e.Op == fsnotify.Write && filepath.Clean(e.Name) == cleanedFilename {
+				logger.DebugContext(ctx, fmt.Sprintf("%s event detected in tools file: %s", e.Op, e.Name))
+				debounce.Reset(debounceDelay)
 			}
+		case <-debounce.C:
+			debounce.Stop()
+			logger.DebugContext(ctx, "re-reading tools file: %s", cleanedFilename)
+			buf, err := os.ReadFile(toolsFileName)
+			if err != nil {
+				logger.WarnContext(ctx, "error reading reloaded file", err)
+				return
+			}
+			validateReloadEdits(ctx, buf, logger)
 		}
 	}
 }
@@ -385,7 +369,7 @@ func run(cmd *Command) error {
 	}()
 
 	// start watching for file changes to trigger dynamic reloading
-	go enableDynamicReloading(string(cmd.tools_file), ctx, cmd.logger)
+	go watchFile(ctx, cmd.tools_file)
 
 	// wait for either the server to error out or the command's context to be canceled
 	select {

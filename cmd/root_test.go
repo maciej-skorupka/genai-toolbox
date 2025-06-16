@@ -38,6 +38,7 @@ import (
 	"github.com/googleapis/genai-toolbox/internal/tools"
 	"github.com/googleapis/genai-toolbox/internal/tools/http"
 	"github.com/googleapis/genai-toolbox/internal/tools/postgressql"
+	"github.com/googleapis/genai-toolbox/internal/util"
 	"github.com/spf13/cobra"
 )
 
@@ -885,9 +886,8 @@ func tmpFileWithCleanup(content []byte) (string, func(), error) {
 	return f.Name(), cleanup, err
 }
 
-// matches server logs a single line that matches the provided regex.
-// adapted from tests/server.go
-func WaitForString(ctx context.Context, re *regexp.Regexp, pr *io.PipeReader, pw *io.PipeWriter) (string, error) {
+// WaitForString is a helper function that waits for a string in the server log that matches the provided regex.
+func WaitForString(ctx context.Context, re *regexp.Regexp, pr *io.PipeReader) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
@@ -966,10 +966,12 @@ func TestSingleEdit(t *testing.T) {
 		t.Fatalf("failed to setup logger %s", err)
 	}
 
-	go enableDynamicReloading(fileToWatch, ctx, logger)
+	ctx = util.WithLogger(ctx, logger)
 
-	begunWatchingFile := regexp.MustCompile(fmt.Sprintf("INFO \"Now watching tools file %s\"", fileToWatch))
-	_, err = WaitForString(ctx, begunWatchingFile, pr, pw)
+	go watchFile(ctx, fileToWatch)
+
+	begunWatchingFile := regexp.MustCompile(fmt.Sprintf("DEBUG \"Now watching tools file %s\"", fileToWatch))
+	_, err = WaitForString(ctx, begunWatchingFile, pr)
 	if err != nil {
 		t.Fatalf("timeout or error waiting for watcher to start")
 	}
@@ -980,7 +982,7 @@ func TestSingleEdit(t *testing.T) {
 	}
 
 	detectedFileChange := regexp.MustCompile(fmt.Sprintf("DEBUG \"WRITE event detected in tools file: %s", fileToWatch))
-	_, err = WaitForString(ctx, detectedFileChange, pr, pw)
+	_, err = WaitForString(ctx, detectedFileChange, pr)
 	if err != nil {
 		t.Fatalf("timeout or error waiting for file to detect write %v", err)
 	}

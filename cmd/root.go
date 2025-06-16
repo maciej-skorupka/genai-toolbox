@@ -168,6 +168,30 @@ func parseToolsFile(ctx context.Context, raw []byte) (ToolsFile, error) {
 	return toolsFile, nil
 }
 
+func handleDynamicReload(ctx context.Context, buf []byte, logger log.Logger) error {
+	toolsFile, err := parseToolsFile(ctx, buf)
+	if err != nil {
+		errMsg := fmt.Errorf("unable to parse reloaded tools file: %w", err)
+		logger.WarnContext(ctx, errMsg.Error())
+		return err
+	}
+
+	sourcesMap, authServicesMap, toolsMap, toolsetsMap, err := validateReloadEdits(ctx, toolsFile, logger)
+	if err != nil {
+		errMsg := fmt.Errorf("unable to validate reloaded edits: %w", err)
+		logger.WarnContext(ctx, errMsg.Error())
+		return err
+	}
+
+	err = updateServer(ctx, logger, sourcesMap, authServicesMap, toolsMap, toolsetsMap)
+	if err != nil {
+		errMsg := fmt.Errorf("unable to update server after reload: %w", err)
+		logger.WarnContext(ctx, errMsg.Error())
+		return err
+	}
+
+	return nil
+}
 
 func validateReloadEdits(ctx context.Context, toolsFile ToolsFile, logger log.Logger) (map[string]sources.Source, map[string]auth.AuthService, map[string]tools.Tool, map[string]tools.Toolset, error) {
 	logger.DebugContext(ctx, "Attempting to parse and validate reloaded tools file.")
@@ -258,7 +282,10 @@ func watchFile(ctx context.Context, toolsFileName string) {
 				logger.WarnContext(ctx, "error reading reloaded file", err)
 				return
 			}
-			validateReloadEdits(ctx, buf, logger)
+			err = handleDynamicReload(ctx, buf, logger)
+			if err != nil {
+				logger.WarnContext(ctx, "error handling dynamic reload", err)
+			}
 		}
 	}
 }
